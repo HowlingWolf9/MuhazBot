@@ -6,6 +6,9 @@ import asyncio
 import aiohttp
 import urllib.parse
 import re
+import time
+import json
+import os
 
 ytdl_format_options = {
     'format': 'bestaudio/best',
@@ -41,8 +44,15 @@ class YTDLSource(discord.PCMVolumeTransformer):
         return data
 
     @classmethod
-    async def create_source(cls, url, *, loop=None):
-        data = await cls.extract_info(url, loop=loop)
+    async def create_source(cls, url_or_data, *, loop=None):
+        if isinstance(url_or_data, dict):
+            data = url_or_data
+        else:
+            data = await cls.extract_info(url_or_data, loop=loop)
+            
+        if 'url' not in data:
+            data = await cls.extract_info(data.get('webpage_url', url_or_data), loop=loop)
+            
         return cls(discord.FFmpegPCMAudio(data['url'], **ffmpeg_options), data=data)
 
 class Song:
@@ -52,6 +62,7 @@ class Song:
         self.title = data.get('title')
         self.url = data.get('webpage_url')
         self.thumbnail = data.get('thumbnail')
+        self.extracted_at = time.time()
 
 class MusicPlayer:
     def __init__(self, interaction: discord.Interaction, cog):
@@ -67,6 +78,7 @@ class MusicPlayer:
         self.volume = 0.5
         self.autoplay = False
         self.history = []
+        self._prefetching = False
 
         self.player_task = self.bot.loop.create_task(self.player_loop())
 
@@ -98,21 +110,31 @@ class MusicPlayer:
                 pass
         return None
 
+    async def prefetch_autoplay(self):
+        if self._prefetching:
+            return
+        self._prefetching = True
+        try:
+            if self.queue.empty() and self.autoplay and self.history:
+                next_url = await self.get_related_video(self.history[-1])
+                if next_url and self.queue.empty() and self.autoplay:
+                    data = await YTDLSource.extract_info(next_url, loop=self.bot.loop)
+                    song = Song(data, self.guild.me)
+                    await self.queue.put(song)
+                    await self.channel.send(f"📻 **Autoplay:** Added **{song.title}** to the queue!")
+        except Exception:
+            pass
+        finally:
+            self._prefetching = False
+
     async def player_loop(self):
         await self.bot.wait_until_ready()
         while not self.bot.is_closed():
             self.next.clear()
             
             if self.queue.empty() and self.autoplay and self.history:
-                next_url = await self.get_related_video(self.history[-1])
-                if next_url:
-                    try:
-                        data = await YTDLSource.extract_info(next_url, loop=self.bot.loop)
-                        song = Song(data, self.guild.me)
-                        await self.queue.put(song)
-                        await self.channel.send(f"📻 **Autoplay:** Added **{song.title}** to the queue!")
-                    except Exception:
-                        pass
+                if not self._prefetching:
+                    self.bot.loop.create_task(self.prefetch_autoplay())
             
             try:
                 # Wait 5 minutes for the next song before disconnecting
@@ -120,9 +142,12 @@ class MusicPlayer:
             except asyncio.TimeoutError:
                 return self.destroy(self.guild)
 
-            # Re-fetch stream URL to avoid expiration issues
+            # Re-fetch stream URL to avoid expiration issues if older than 2 hours
             try:
-                source = await YTDLSource.create_source(song.url, loop=self.bot.loop)
+                if hasattr(song, 'extracted_at') and time.time() - song.extracted_at < 7200 and song.data.get('url'):
+                    source = await YTDLSource.create_source(song.data, loop=self.bot.loop)
+                else:
+                    source = await YTDLSource.create_source(song.url, loop=self.bot.loop)
             except Exception as e:
                 # Skip to next song if extraction fails
                 self.bot.loop.call_soon_threadsafe(self.next.set)
@@ -151,10 +176,14 @@ class MusicPlayer:
                 embed.set_thumbnail(url=song.thumbnail)
             embed.add_field(name="Requested by", value=song.requester.mention)
             
+            view = PlayerView(self.cog, self)
             try:
-                await self.channel.send(embed=embed)
+                await self.channel.send(embed=embed, view=view)
             except Exception:
                 pass
+            
+            if self.autoplay and self.queue.empty() and self.history:
+                self.bot.loop.create_task(self.prefetch_autoplay())
             
             await self.next.wait()
             self.current = None
@@ -214,16 +243,89 @@ class SearchView(discord.ui.View):
             return False
         return True
 
+class PlayerView(discord.ui.View):
+    def __init__(self, cog, player):
+        super().__init__(timeout=None)
+        self.cog = cog
+        self.player = player
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if not interaction.user.voice:
+            await interaction.response.send_message("🔴 You need to join a voice channel first!", ephemeral=True)
+            return False
+        if interaction.guild.voice_client and interaction.guild.voice_client.channel != interaction.user.voice.channel:
+            await interaction.response.send_message("🔴 You must be in the same voice channel as the bot.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(style=discord.ButtonStyle.primary, emoji="⏯️")
+    async def pause_resume(self, interaction: discord.Interaction, button: discord.ui.Button):
+        vc = interaction.guild.voice_client
+        if not vc:
+            return await interaction.response.send_message("Nothing is playing.", ephemeral=True)
+        if vc.is_playing():
+            vc.pause()
+            await interaction.response.send_message("⏸️ Paused the music.", ephemeral=True)
+        elif vc.is_paused():
+            vc.resume()
+            await interaction.response.send_message("▶️ Resumed the music.", ephemeral=True)
+        else:
+            await interaction.response.send_message("Nothing is playing.", ephemeral=True)
+
+    @discord.ui.button(style=discord.ButtonStyle.secondary, emoji="⏭️")
+    async def skip(self, interaction: discord.Interaction, button: discord.ui.Button):
+        vc = interaction.guild.voice_client
+        if vc and (vc.is_playing() or vc.is_paused()):
+            vc.stop()
+            await interaction.response.send_message("⏭️ Skipped the song.", ephemeral=True)
+        else:
+            await interaction.response.send_message("Nothing to skip.", ephemeral=True)
+
+    @discord.ui.button(style=discord.ButtonStyle.danger, emoji="⏹️")
+    async def stop(self, interaction: discord.Interaction, button: discord.ui.Button):
+        while not self.player.queue.empty():
+            try:
+                self.player.queue.get_nowait()
+                self.player.queue.task_done()
+            except asyncio.QueueEmpty:
+                break
+        vc = interaction.guild.voice_client
+        if vc and (vc.is_playing() or vc.is_paused()):
+            vc.stop()
+        await interaction.response.send_message("⏹️ Stopped music and cleared the queue.", ephemeral=True)
+
 class MusicCog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         self.players = {}
+        self.settings_file = "music_settings.json"
+        self.settings = self.load_settings()
+
+    def load_settings(self):
+        if os.path.exists(self.settings_file):
+            try:
+                with open(self.settings_file, "r") as f:
+                    return json.load(f)
+            except Exception:
+                return {}
+        return {}
+
+    def save_settings(self):
+        try:
+            with open(self.settings_file, "w") as f:
+                json.dump(self.settings, f)
+        except Exception as e:
+            print(f"Failed to save settings: {e}")
 
     def get_player(self, interaction):
         try:
             player = self.players[interaction.guild.id]
         except KeyError:
             player = MusicPlayer(interaction, self)
+            guild_id = str(interaction.guild.id)
+            if guild_id in self.settings:
+                player.autoplay = self.settings[guild_id].get("autoplay", False)
+                player.volume = self.settings[guild_id].get("volume", 0.5)
             self.players[interaction.guild.id] = player
         return player
 
@@ -332,6 +434,24 @@ class MusicCog(commands.Cog):
         voice_client.stop()
         await interaction.response.send_message("⏭️ Skipped the current song.")
 
+    @app_commands.command(name='stop', description="Stop the music and clear the queue")
+    async def stop(self, interaction: discord.Interaction):
+        if not await self.verify_voice(interaction): return
+        
+        player = self.get_player(interaction)
+        while not player.queue.empty():
+            try:
+                player.queue.get_nowait()
+                player.queue.task_done()
+            except asyncio.QueueEmpty:
+                break
+        
+        voice_client = interaction.guild.voice_client
+        if voice_client and (voice_client.is_playing() or voice_client.is_paused()):
+            voice_client.stop()
+            
+        await interaction.response.send_message("⏹️ Stopped the music and cleared the queue.")
+
     @app_commands.command(name='pause', description="Pause the music")
     async def pause(self, interaction: discord.Interaction):
         if not await self.verify_voice(interaction): return
@@ -380,7 +500,9 @@ class MusicCog(commands.Cog):
         if player.current.thumbnail:
             embed.set_thumbnail(url=player.current.thumbnail)
         embed.add_field(name="Requested by", value=player.current.requester.mention)
-        await interaction.response.send_message(embed=embed)
+        
+        view = PlayerView(self, player)
+        await interaction.response.send_message(embed=embed, view=view)
 
     @app_commands.command(name='volume', description="Set the volume of the bot (1-100)")
     async def volume(self, interaction: discord.Interaction, vol: int):
@@ -390,10 +512,18 @@ class MusicCog(commands.Cog):
             return await interaction.response.send_message("Please enter a value between 1 and 100.", ephemeral=True)
             
         player = self.get_player(interaction)
+        new_vol = vol / 100.0
         if interaction.guild.voice_client and getattr(interaction.guild.voice_client, 'source', None):
-            interaction.guild.voice_client.source.volume = vol / 100.0
+            interaction.guild.voice_client.source.volume = new_vol
             
-        player.volume = vol / 100.0
+        player.volume = new_vol
+        
+        guild_id = str(interaction.guild.id)
+        if guild_id not in self.settings:
+            self.settings[guild_id] = {}
+        self.settings[guild_id]["volume"] = new_vol
+        self.save_settings()
+        
         await interaction.response.send_message(f"🔊 Changed volume to {vol}%")
 
     @app_commands.command(name='leave', description="Clear the queue and leave the voice channel")
@@ -413,12 +543,21 @@ class MusicCog(commands.Cog):
         player = self.get_player(interaction)
         player.autoplay = not player.autoplay
         
+        guild_id = str(interaction.guild.id)
+        if guild_id not in self.settings:
+            self.settings[guild_id] = {}
+        self.settings[guild_id]["autoplay"] = player.autoplay
+        self.save_settings()
+        
         status = "enabled" if player.autoplay else "disabled"
         await interaction.response.send_message(f"📻 Autoplay is now **{status}**.")
         
         # If queue is empty and autoplay was just enabled, trigger the next clear to auto-queue immediately
-        if player.autoplay and player.queue.empty() and player.history and not player.current:
-            self.bot.loop.call_soon_threadsafe(player.next.set)
+        if player.autoplay and player.queue.empty() and player.history:
+            if not player.current:
+                self.bot.loop.call_soon_threadsafe(player.next.set)
+            else:
+                self.bot.loop.create_task(player.prefetch_autoplay())
 
 async def setup(bot):
     await bot.add_cog(MusicCog(bot))
