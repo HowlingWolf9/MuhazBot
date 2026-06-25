@@ -5,6 +5,7 @@ import yt_dlp
 import asyncio
 import aiohttp
 import urllib.parse
+import re
 
 ytdl_format_options = {
     'format': 'bestaudio/best',
@@ -64,13 +65,54 @@ class MusicPlayer:
         
         self.current = None
         self.volume = 0.5
+        self.autoplay = False
+        self.history = []
 
         self.player_task = self.bot.loop.create_task(self.player_loop())
+
+    async def get_related_video(self, url):
+        match = re.search(r"v=([a-zA-Z0-9_-]+)", url)
+        if not match:
+            match = re.search(r"youtu\.be/([a-zA-Z0-9_-]+)", url)
+            
+        if match:
+            video_id = match.group(1)
+            mix_url = f"https://www.youtube.com/watch?v={video_id}&list=RD{video_id}"
+            ydl_opts = {'extract_flat': True, 'quiet': True}
+            
+            def extract():
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    return ydl.extract_info(mix_url, download=False)
+                    
+            try:
+                data = await self.bot.loop.run_in_executor(None, extract)
+                if data and 'entries' in data:
+                    for entry in data['entries']:
+                        entry_url = entry.get('url') or entry.get('webpage_url')
+                        if not entry_url and entry.get('id'):
+                            entry_url = f"https://www.youtube.com/watch?v={entry.get('id')}"
+                            
+                        if entry_url and entry_url not in self.history:
+                            return entry_url
+            except Exception:
+                pass
+        return None
 
     async def player_loop(self):
         await self.bot.wait_until_ready()
         while not self.bot.is_closed():
             self.next.clear()
+            
+            if self.queue.empty() and self.autoplay and self.history:
+                next_url = await self.get_related_video(self.history[-1])
+                if next_url:
+                    try:
+                        data = await YTDLSource.extract_info(next_url, loop=self.bot.loop)
+                        song = Song(data, self.guild.me)
+                        await self.queue.put(song)
+                        await self.channel.send(f"📻 **Autoplay:** Added **{song.title}** to the queue!")
+                    except Exception:
+                        pass
             
             try:
                 # Wait 5 minutes for the next song before disconnecting
@@ -87,6 +129,11 @@ class MusicPlayer:
                 continue
 
             self.current = song
+            if song.url and song.url not in self.history:
+                self.history.append(song.url)
+            if len(self.history) > 20:
+                self.history.pop(0)
+            
             self.current.source = source
             
             source.volume = self.volume
@@ -358,6 +405,20 @@ class MusicCog(commands.Cog):
             await interaction.response.send_message("🛑 Cleared the queue and disconnected.")
         else:
             await interaction.response.send_message("I am not connected to a voice channel.", ephemeral=True)
+
+    @app_commands.command(name='autoplay', description="Toggle autoplay (automatically queues related songs when the queue is empty)")
+    async def autoplay(self, interaction: discord.Interaction):
+        if not await self.verify_voice(interaction): return
+        
+        player = self.get_player(interaction)
+        player.autoplay = not player.autoplay
+        
+        status = "enabled" if player.autoplay else "disabled"
+        await interaction.response.send_message(f"📻 Autoplay is now **{status}**.")
+        
+        # If queue is empty and autoplay was just enabled, trigger the next clear to auto-queue immediately
+        if player.autoplay and player.queue.empty() and player.history and not player.current:
+            self.bot.loop.call_soon_threadsafe(player.next.set)
 
 async def setup(bot):
     await bot.add_cog(MusicCog(bot))
