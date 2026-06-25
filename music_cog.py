@@ -3,6 +3,8 @@ from discord import app_commands
 from discord.ext import commands
 import yt_dlp
 import asyncio
+import aiohttp
+import urllib.parse
 
 ytdl_format_options = {
     'format': 'bestaudio/best',
@@ -198,7 +200,26 @@ class MusicCog(commands.Cog):
             return False
         return True
 
+    async def song_autocomplete(self, interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+        if not current:
+            return []
+        try:
+            async with aiohttp.ClientSession() as session:
+                api_url = f"http://suggestqueries.google.com/complete/search?client=firefox&ds=yt&q={urllib.parse.quote(current)}"
+                async with session.get(api_url) as resp:
+                    if resp.status == 200:
+                        data = await resp.json(content_type=None)
+                        suggestions = data[1]
+                        return [
+                            app_commands.Choice(name=suggestion[:100], value=suggestion[:100])
+                            for suggestion in suggestions[:25]
+                        ]
+        except Exception:
+            pass
+        return [app_commands.Choice(name=current[:100], value=current[:100])]
+
     @app_commands.command(name='play', description="Play a song or add it to the queue")
+    @app_commands.autocomplete(url=song_autocomplete)
     async def play(self, interaction: discord.Interaction, url: str):
         if not await self.verify_voice(interaction): return
             
@@ -229,6 +250,7 @@ class MusicCog(commands.Cog):
             await interaction.followup.send("⏳ Loading track...")
 
     @app_commands.command(name='search', description="Search for a song and choose from the results")
+    @app_commands.autocomplete(query=song_autocomplete)
     async def search(self, interaction: discord.Interaction, query: str):
         if not await self.verify_voice(interaction): return
             
